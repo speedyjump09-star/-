@@ -6,7 +6,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "steam-user": "^5.0.8",
-    "steam-totp": "^2.1.2"
+    "steam-user": "^5.0.8"
   }
 }
