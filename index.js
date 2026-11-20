@@ -87,3 +87,10 @@ client.on('error', (err) => {
 });
 
 logIn();
+
+setInterval(() => {
+  if (client.steamID) {
+    client.gamesPlayed(GAMES);
+  }
+}, 6 * 60 * 60 * 1000);
+
