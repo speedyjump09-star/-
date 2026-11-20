@@ -70,6 +70,20 @@ client.on('playingState', (blocked, playingApp) => {
 
 client.on('error', (err) => {
   console.error('[Steam Ошибка]:', err.message);
+  if (err.eresult === 6 || err.message.includes('LoggedInElsewhere')) {
+    console.log('[Steam] Сессия занята на другом ПК. Жду освобождения...');
+    const retryInterval = setInterval(() => {
+      if (client.steamID) {
+        client.gamesPlayed(GAMES);
+      }
+    }, 60000);
+    client.once('playingState', (blocked) => {
+      if (!blocked) {
+        clearInterval(retryInterval);
+        console.log('[Steam] Слот освободился, накрутка возобновлена!');
+      }
+    });
+  }
 });
 
 logIn();
