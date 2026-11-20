@@ -1,96 +1,108 @@
 const http = require('http');
+const https = require('https');
 const SteamUser = require('steam-user');
 
-const PORT = process.env.PORT || 3000;
+const REFRESH_TOKEN = process.env.STEAM_REFRESH_TOKEN;
+const GAMES = (process.env.STEAM_GAMES || '730')
+  .split(',')
+  .map((id) => parseInt(id.trim(), 10))
+  .filter(Boolean)
+  .slice(0, 32);
+const PORT = process.env.PORT || 10000;
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://steam-booster-fq2w.onrender.com';
+
+if (!REFRESH_TOKEN) {
+  console.error('[Ошибка] Не задана переменная STEAM_REFRESH_TOKEN!');
+  process.exit(1);
+}
+
+// 1. Защита от случайных падений Node.js при сетевых сбоях Steam
+process.on('uncaughtException', (err) => {
+  console.error('[Система] Перехвачена ошибка:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[Система] Перехвачен сбой промиса:', reason);
+});
+
+// 2. HTTP-сервер + самопинг каждые 10 минут (страховка для cron-job.org)
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Steam Hour Booster is running');
+  res.end('Steam Booster OK');
 }).listen(PORT, () => {
   console.log(`[HTTP] Сервер запущен на порту ${PORT}`);
 });
 
-const USERNAME = process.env.STEAM_USERNAME;
-const PASSWORD = process.env.STEAM_PASSWORD;
-const REFRESH_TOKEN = process.env.STEAM_REFRESH_TOKEN;
-
-const GAMES = (process.env.STEAM_GAMES || '730')
-  .split(',')
-  .map(id => Number(id.trim()))
-  .filter(Boolean)
-  .slice(0, 32);
-
-const client = new SteamUser();
-
-function logIn() {
-  if (REFRESH_TOKEN) {
-    console.log('[Steam] Вход по сохранённому REFRESH_TOKEN...');
-    client.logOn({ refreshToken: REFRESH_TOKEN });
-  } else {
-    console.log('[Steam] Вход по логину и паролю...');
-    client.logOn({
-      accountName: USERNAME,
-      password: PASSWORD,
-      promptSteamGuardCode: false
+setInterval(() => {
+  if (SELF_URL) {
+    https.get(SELF_URL, (res) => {
+      res.resume();
+    }).on('error', (err) => {
+      console.error('[Self-Ping] Ошибка:', err.message);
     });
   }
+}, 10 * 60 * 1000);
+
+// 3. Клиент Steam с автовосстановлением
+const client = new SteamUser({ autoRelogin: true });
+
+let isBlocked = false;
+let reconnectTimer = null;
+
+function scheduleRelogin(delayMs) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!client.steamID) logIn();
+  }, delayMs);
 }
 
-client.on('steamGuard', (domain, callback) => {
-  const code = process.env.STEAM_GUARD_CODE;
-  if (code) {
-    console.log(`[Steam] Ввожу код Steam Guard: ${code}`);
-    callback(code.trim());
-  } else {
-    console.log('[Steam] Жду пуш-подтверждение в телефоне ИЛИ добавь свежий код в STEAM_GUARD_CODE...');
-  }
-});
-
-client.on('refreshToken', (token) => {
-  console.log('====================================================');
-  console.log('[ВАЖНО] Скопируй этот токен и добавь в Render как STEAM_REFRESH_TOKEN:');
-  console.log(token);
-  console.log('====================================================');
-});
+function logIn() {
+  if (client.steamID) return;
+  console.log('[Steam] Вход по сохранённому REFRESH_TOKEN...');
+  client.logOn({ refreshToken: REFRESH_TOKEN });
+}
 
 client.on('loggedOn', () => {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   console.log(`[Steam] Успешный вход как ${client.steamID.getSteamID64()}`);
   client.setPersona(SteamUser.EPersonaState.Invisible);
-  client.gamesPlayed(GAMES);
-  console.log(`[Steam] Запущена накрутка часов для AppID: ${GAMES.join(', ')}`);
+  // Не запускаем игры сразу вслепую — ждём ответ сервера в playingState,
+  // чтобы не выкинуть тебя из игры на ПК при переподключении
 });
 
-client.on('playingState', (blocked, playingApp) => {
+client.on('playingState', (blocked) => {
+  isBlocked = blocked;
   if (blocked) {
-    console.log(`[Steam] Пауза: ты сам запустил игру (AppID: ${playingApp}).`);
+    console.log('[Steam] Пауза: ты сам запустил игру на ПК.');
   } else {
-    console.log('[Steam] Ты вышел из игры. Возобновляем накрутку...');
+    console.log(`[Steam] Слот свободен. Запущена накрутка для AppID: ${GAMES.join(', ')}`);
     client.gamesPlayed(GAMES);
   }
+});
+
+client.on('disconnected', (eresult, msg) => {
+  isBlocked = false;
+  console.log(`[Steam] Разрыв соединения (${msg || eresult}). Ожидание реконнекта...`);
 });
 
 client.on('error', (err) => {
   console.error('[Steam Ошибка]:', err.message);
   if (err.eresult === 6 || err.message.includes('LoggedInElsewhere')) {
-    console.log('[Steam] Сессия занята на другом ПК. Жду освобождения...');
-    const retryInterval = setInterval(() => {
-      if (client.steamID) {
-        client.gamesPlayed(GAMES);
-      }
-    }, 60000);
-    client.once('playingState', (blocked) => {
-      if (!blocked) {
-        clearInterval(retryInterval);
-        console.log('[Steam] Слот освободился, накрутка возобновлена!');
-      }
-    });
+    console.log('[Steam] Сессия выбита другим ПК. Перевход в режим ожидания через 60 сек...');
+    scheduleRelogin(60000);
+  } else {
+    scheduleRelogin(30000);
   }
 });
 
-logIn();
-
+// Страховка от зависания сессии после вторничного ТО серверов Valve (раз в 6 часов)
 setInterval(() => {
-  if (client.steamID) {
+  if (client.steamID && !isBlocked) {
     client.gamesPlayed(GAMES);
   }
 }, 6 * 60 * 60 * 1000);
 
+logIn();
