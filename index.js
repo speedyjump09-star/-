@@ -42,35 +42,61 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-// 3. Клиент Steam с автовосстановлением
-const client = new SteamUser({ autoRelogin: true });
+// 3. Клиент Steam (autoRelogin: false, чтобы не конфликтовал с нашим дебаунсером и Watchdog)
+const client = new SteamUser({ autoRelogin: false });
 
 let isBlocked = false;
+let isLoggingIn = false;
 let reconnectTimer = null;
+let loginTimeout = null;
+
+function clearTimers() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (loginTimeout) {
+    clearTimeout(loginTimeout);
+    loginTimeout = null;
+  }
+}
 
 function scheduleRelogin(delayMs) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    if (!client.steamID) logIn();
+    logIn();
   }, delayMs);
 }
 
 function logIn() {
-  if (client.steamID) return;
+  if (client.steamID || isLoggingIn) return;
+  isLoggingIn = true;
   console.log('[Steam] Вход по сохранённому REFRESH_TOKEN...');
-  client.logOn({ refreshToken: REFRESH_TOKEN });
+
+  // Сброс флага, если сервер Steam завис и не ответил за 25 секунд
+  if (loginTimeout) clearTimeout(loginTimeout);
+  loginTimeout = setTimeout(() => {
+    if (isLoggingIn && !client.steamID) {
+      console.log('[Steam] Таймаут входа. Сброс состояния...');
+      isLoggingIn = false;
+    }
+  }, 25000);
+
+  try {
+    client.logOn({ refreshToken: REFRESH_TOKEN });
+  } catch (err) {
+    isLoggingIn = false;
+    console.error('[Steam] Ошибка вызова logOn:', err.message);
+    scheduleRelogin(30000);
+  }
 }
 
 client.on('loggedOn', () => {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
+  isLoggingIn = false;
+  clearTimers();
   console.log(`[Steam] Успешный вход как ${client.steamID.getSteamID64()}`);
   client.setPersona(SteamUser.EPersonaState.Invisible);
-  // Не запускаем игры сразу вслепую — ждём ответ сервера в playingState,
-  // чтобы не выкинуть тебя из игры на ПК при переподключении
 });
 
 client.on('playingState', (blocked) => {
@@ -84,25 +110,45 @@ client.on('playingState', (blocked) => {
 });
 
 client.on('disconnected', (eresult, msg) => {
+  isLoggingIn = false;
   isBlocked = false;
-  console.log(`[Steam] Разрыв соединения (${msg || eresult}). Ожидание реконнекта...`);
+  if (loginTimeout) {
+    clearTimeout(loginTimeout);
+    loginTimeout = null;
+  }
+  console.log(`[Steam] Разрыв соединения (${msg || eresult}). Реконнект через 30 сек...`);
+  scheduleRelogin(30000);
 });
 
 client.on('error', (err) => {
+  isLoggingIn = false;
+  if (loginTimeout) {
+    clearTimeout(loginTimeout);
+    loginTimeout = null;
+  }
   console.error('[Steam Ошибка]:', err.message);
+
   if (err.eresult === 6 || err.message.includes('LoggedInElsewhere')) {
     console.log('[Steam] Сессия выбита другим ПК. Перевход в режим ожидания через 60 сек...');
     scheduleRelogin(60000);
+  } else if (err.eresult === 84 || err.message.includes('RateLimitExceeded')) {
+    console.log('[Steam] Лимит запросов (RateLimit). Пауза 20 минут...');
+    scheduleRelogin(20 * 60 * 1000);
+  } else if (err.eresult === 5 || err.eresult === 15 || err.message.includes('InvalidPassword')) {
+    console.error('[Критично] REFRESH_TOKEN истёк или отозван! Обнови STEAM_REFRESH_TOKEN в настройках Render.');
   } else {
     scheduleRelogin(30000);
   }
 });
 
-// Страховка от зависания сессии после вторничного ТО серверов Valve (раз в 6 часов)
+// Watchdog: каждые 5 минут проверяет, не завис ли бот в офлайне после ТО серверов Valve
 setInterval(() => {
-  if (client.steamID && !isBlocked) {
+  if (!client.steamID && !isLoggingIn && !reconnectTimer) {
+    console.log('[Watchdog] Бот не в сети. Принудительный вход...');
+    logIn();
+  } else if (client.steamID && !isBlocked) {
     client.gamesPlayed(GAMES);
   }
-}, 6 * 60 * 60 * 1000);
+}, 5 * 60 * 1000);
 
 logIn();
